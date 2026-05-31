@@ -1,4 +1,4 @@
-name: 📈 Forex Overextension Scanner
+name: 📈 FX Wicks Bot — Wick Break Scanner
 
 # ─── Déclencheurs ─────────────────────────────────────────────────────────────
 on:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   scan:
-    name: Scan overextensions
+    name: Scan wick breaks
     runs-on: ubuntu-latest
     timeout-minutes: 12       # Tue le job si bloqué (sécurité)
 

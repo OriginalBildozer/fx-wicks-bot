@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Forex Overextension Bot — GitHub Actions edition
-• Exécuté une seule fois par run (le cron GH Actions remplace la boucle infinie)
-• L'état anti-doublon est persisté via le cache GitHub Actions entre les runs
+FX Wicks Bot — GitHub Actions edition
+Détecte les cassures de mèches (wick breaks) sur les swings H1 :
+  - Cassure sous la mèche basse d'un swing LOW  → signal bullish (liquidity sweep)
+  - Cassure au-dessus de la mèche haute d'un swing HIGH → signal bearish
+Exécuté une seule fois par run (le cron GH Actions remplace la boucle infinie).
+L'état anti-doublon est persisté via le cache GitHub Actions entre les runs.
 """
 
 import asyncio
@@ -10,7 +13,6 @@ import io
 import json
 import logging
 import os
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -18,17 +20,16 @@ from zoneinfo import ZoneInfo
 TZ_PARIS = ZoneInfo("Europe/Paris")
 
 def _now_paris() -> datetime:
-    """Heure courante en timezone Europe/Paris."""
     return datetime.now(TZ_PARIS)
 
 import matplotlib
-matplotlib.use("Agg")   # backend non-interactif (headless CI)
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from dotenv import load_dotenv   # no-op si .env absent (OK en CI)
+from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 load_dotenv()
@@ -43,13 +44,11 @@ _handler.setFormatter(_ParisFormatter("%(asctime)s [%(levelname)s] %(message)s")
 logging.basicConfig(level=logging.INFO, handlers=[_handler])
 log = logging.getLogger(__name__)
 
-# ─── Credentials (injectés via Secrets GH Actions ou .env local) ─────────────
+# ─── Credentials ──────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
 
 # ─── Univers des paires ───────────────────────────────────────────────────────
-# yf : ticker yfinance (source gratuite)
-# tv : symbole URL encodé pour le lien TradingView
 FOREX_PAIRS: dict[str, dict] = {
 
     # ── Crypto ─────────────────────────────────────────────────────────────
@@ -97,39 +96,17 @@ FOREX_PAIRS: dict[str, dict] = {
 }
 
 # ─── Paramètres de détection ──────────────────────────────────────────────────
-RSI_PERIOD          = 14
-ATR_PERIOD          = 14
-EMA_FAST            = 20
-EMA_SLOW            = 50
+ATR_PERIOD           = 14
+SWING_LOOKBACK       = 1    # 1 bougie de chaque côté suffit pour confirmer un swing
+SWING_SEARCH_WINDOW  = 168  # fenêtre de recherche en bougies H1 (7 jours)
+MIN_WICK_BODY_RATIO  = 1.5  # mèche doit faire ≥ 1.5× le corps de la bougie
 
-RSI_OVERBOUGHT      = 67     # RSI > seuil → excès haussier
-RSI_OVERSOLD        = 33     # RSI < seuil → excès baissier
-
-ATR_MULT_IMPULSE    = 1.5    # Impulsion doit dépasser N × ATR
-ATR_MULT_EMA_DIST   = 1.5    # Distance EMA doit dépasser N × ATR
-
-IMPULSE_WINDOW      = 3      # Bougies sur lesquelles mesurer l'impulsion
-CANDLE_RANGE_LOOKBACK = 3    # Nombre de bougies précédentes pour la moyenne range
-# Logique : (RSI OU Impulsion OU EMA-dist OU EMA+Range)  ET  (retracement ≤ 20 %)
-
-COOLDOWN_HOURS      = 4      # Délai avant de re-alerter même paire/direction
-CHART_RIGHT_MARGIN  = 12     # Espace vide à droite (12h à venir)
-
+COOLDOWN_HOURS      = 4
+CHART_RIGHT_MARGIN  = 12
 ALERT_STATE_FILE    = Path("alert_state.json")
 
 
-
-# ─── Indicateurs techniques ───────────────────────────────────────────────────
-
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta    = series.diff()
-    gain     = delta.clip(lower=0)
-    loss     = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    rs       = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
+# ─── Indicateur technique ─────────────────────────────────────────────────────
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     hl = df["High"] - df["Low"]
@@ -139,207 +116,188 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(com=period - 1, min_periods=period).mean()
 
 
-def compute_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
 # ─── Récupération des données ─────────────────────────────────────────────────
 
 def fetch_h1_data(yf_ticker: str) -> pd.DataFrame | None:
-    """Télécharge 15 jours de données H1 via yfinance (source gratuite)."""
     try:
         df = yf.download(
             yf_ticker,
-            period="15d",
+            period="20d",
             interval="1h",
             progress=False,
             auto_adjust=True,
         )
-        if df.empty or len(df) < 60:
+        if df.empty or len(df) < 30:
             log.warning(f"Données insuffisantes pour {yf_ticker} ({len(df)} bougies)")
             return None
-
-        # Aplatir le MultiIndex (yfinance ≥ 0.2.x retourne un MultiIndex)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
-
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         return df
-
     except Exception as exc:
         log.error(f"Erreur fetch {yf_ticker}: {exc}")
         return None
 
 
-# ─── Détection de l'overextension ────────────────────────────────────────────
+# ─── Détection des cassures de mèches ────────────────────────────────────────
 
-def _strength_stars(n: int, total: int = 4) -> str:
-    """Étoiles colorées selon le nombre de conditions déclenchées.
-    1 → rouge  |  2-3 → orange  |  4 → vert
-    Ex : 🟠 ★★★☆
+def _find_swings(history: pd.DataFrame, atr: float) -> tuple[list, list]:
     """
-    color = "🔴" if n == 1 else ("🟢" if n == total else "🟠")
-    return f"{color} {'★' * n}{'☆' * (total - n)}"
+    Retourne les swing highs et swing lows confirmés dans history.
+    Chaque élément : (position_dans_history, wick_level, timestamp, wick_body_ratio)
 
-
-def detect_overextension(df: pd.DataFrame) -> dict:
+    Filtre : mèche ≥ MIN_WICK_BODY_RATIO × corps.
+    Pour les dojis (corps quasi-nul), on utilise 5 % de l'ATR comme corps minimal
+    afin d'éviter la division par zéro et de ne pas retenir des mèches microscopiques.
     """
-    Retourne TOUJOURS un dict. Vérifier result["detected"] pour savoir
-    si une overextension a été trouvée.
+    n = len(history)
+    swing_highs = []
+    swing_lows  = []
 
-    Logique : (RSI OU Impulsion OU EMA-dist OU EMA+Range)  ET  retracement ≤ 20 %
+    start = max(SWING_LOOKBACK, n - SWING_SEARCH_WINDOW - SWING_LOOKBACK)
+    end   = n - SWING_LOOKBACK
+
+    for i in range(start, end):
+        candle = history.iloc[i]
+        left   = history.iloc[max(0, i - SWING_LOOKBACK):i]
+        right  = history.iloc[i + 1:i + SWING_LOOKBACK + 1]
+
+        if len(left) < SWING_LOOKBACK or len(right) < SWING_LOOKBACK:
+            continue
+
+        c_high  = float(candle["High"])
+        c_low   = float(candle["Low"])
+        c_open  = float(candle["Open"])
+        c_close = float(candle["Close"])
+        body    = max(abs(c_open - c_close), atr * 0.05)  # plancher anti-doji
+
+        # Swing HIGH — mèche haute ≥ MIN_WICK_BODY_RATIO × corps
+        if c_high > left["High"].max() and c_high > right["High"].max():
+            body_top  = max(c_open, c_close)
+            wick_size = c_high - body_top
+            ratio     = wick_size / body
+            if ratio >= MIN_WICK_BODY_RATIO:
+                swing_highs.append((i, c_high, history.index[i], round(ratio, 2)))
+
+        # Swing LOW — mèche basse ≥ MIN_WICK_BODY_RATIO × corps
+        if c_low < left["Low"].min() and c_low < right["Low"].min():
+            body_bot  = min(c_open, c_close)
+            wick_size = body_bot - c_low
+            ratio     = wick_size / body
+            if ratio >= MIN_WICK_BODY_RATIO:
+                swing_lows.append((i, c_low, history.index[i], round(ratio, 2)))
+
+    return swing_highs, swing_lows
+
+
+def detect_wick_break(df: pd.DataFrame) -> dict:
+    """
+    Vérifie si la dernière bougie casse la mèche d'un swing high/low récent.
+
+    - Cassure sous swing LOW wick  → bullish (liquidity sweep, attendre reversal haussier)
+    - Cassure au-dessus swing HIGH wick → bearish (liquidity sweep, attendre reversal baissier)
+
+    Cherche en priorité le swing le plus récent cassé.
     """
     df = df.copy()
-    df["RSI"]      = compute_rsi(df["Close"], RSI_PERIOD)
-    df["ATR"]      = compute_atr(df, ATR_PERIOD)
-    df["EMA_fast"] = compute_ema(df["Close"], EMA_FAST)
-    df["EMA_slow"] = compute_ema(df["Close"], EMA_SLOW)
+    df["ATR"] = compute_atr(df, ATR_PERIOD)
 
-    last   = df.iloc[-1]
-    window = df.iloc[-(IMPULSE_WINDOW + 1):]
+    last = df.iloc[-1]
+    atr  = float(last["ATR"])
 
-    rsi      = last["RSI"]
-    atr      = last["ATR"]
-    price    = last["Close"]
-    ema_fast = last["EMA_fast"]
-
-    # Valeurs de base toujours retournées pour les logs
-    base: dict = {
-        "detected":        False,
-        "reject_reason":   "",
-        "price":           round(float(price), 5),
-        "atr":             round(float(atr), 6) if not pd.isna(atr) else 0,
-        "rsi":             round(float(rsi), 1) if not pd.isna(rsi) else 0,
-        "impulse_atr":     0.0,
-        "ema_dist_atr":    0.0,
-        "candle_range_ratio": 0.0,   # range actuel / moyenne des N précédentes
+    base = {
+        "detected":      False,
+        "reject_reason": "",
+        "price":         round(float(last["Close"]), 5),
+        "last_high":     round(float(last["High"]), 5),
+        "last_low":      round(float(last["Low"]), 5),
+        "atr":           round(atr, 6) if not pd.isna(atr) else 0,
     }
 
-    if pd.isna(rsi) or pd.isna(atr) or atr == 0:
-        base["reject_reason"] = "indicateurs invalides"
+    if pd.isna(atr) or atr == 0:
+        base["reject_reason"] = "ATR invalide"
         return base
 
-    impulse_start   = window.iloc[0]["Close"]
-    signed_impulse  = float(price - impulse_start)
-    ema_dist_signed = float(price - ema_fast)
+    history = df.iloc[:-1]  # exclure la dernière bougie (candidate à la cassure)
+    swing_highs, swing_lows = _find_swings(history, atr)
 
-    base["impulse_atr"]  = round(float(signed_impulse / atr), 2)
-    base["ema_dist_atr"] = round(float(ema_dist_signed / atr), 2)
-
-    # ── Évaluation de toutes les conditions ──────────────────────────────
-    rsi_bull = rsi > RSI_OVERBOUGHT
-    rsi_bear = rsi < RSI_OVERSOLD
-
-    bullish_signals, bearish_signals = [], []
-
-    # 2 — Impulsion
-    imp_bull = signed_impulse > ATR_MULT_IMPULSE * atr
-    imp_bear = signed_impulse < -ATR_MULT_IMPULSE * atr
-
-    # 3 — Distance EMA20
-    ema_bull = ema_dist_signed > ATR_MULT_EMA_DIST * atr
-    ema_bear = ema_dist_signed < -ATR_MULT_EMA_DIST * atr
-
-    # Calcul du range — condition 4
-    current_range   = float(last["High"] - last["Low"])
-    avg_before_curr = sum(
-        float(df.iloc[-i]["High"] - df.iloc[-i]["Low"])
-        for i in range(2, 2 + CANDLE_RANGE_LOOKBACK)
-    ) / CANDLE_RANGE_LOOKBACK
-    ratio_curr = (current_range / avg_before_curr) if avg_before_curr > 0 else 0.0
-
-    prev_candle      = df.iloc[-2]
-    prev_range       = float(prev_candle["High"] - prev_candle["Low"])
-    avg_before_prev  = sum(
-        float(df.iloc[-i]["High"] - df.iloc[-i]["Low"])
-        for i in range(3, 3 + CANDLE_RANGE_LOOKBACK)
-    ) / CANDLE_RANGE_LOOKBACK
-    ratio_prev = (prev_range / avg_before_prev) if avg_before_prev > 0 else 0.0
-
-    range_ratio = max(ratio_curr, ratio_prev)
-    base["candle_range_ratio"] = round(range_ratio, 2)
-    range_cond = ratio_curr >= 2.0 or ratio_prev >= 2.0
-
-    # ── Logique : (① ET (② OU ③))  OU  ④ ────────────────────────────────
-    rsi_plus_other = (rsi_bull or rsi_bear) and (imp_bull or imp_bear or ema_bull or ema_bear)
-
-    if not rsi_plus_other and not range_cond:
-        base["reject_reason"] = "conditions non remplies"
+    if not swing_highs and not swing_lows:
+        base["reject_reason"] = "aucun swing valide trouvé"
         return base
 
-    # Construire les listes de signaux
-    if rsi_plus_other:
-        if rsi_bull:
-            bullish_signals.append(f"RSI {rsi:.1f} > {RSI_OVERBOUGHT}")
-        else:
-            bearish_signals.append(f"RSI {rsi:.1f} < {RSI_OVERSOLD}")
-        if imp_bull:  bullish_signals.append(f"Impulsion +{signed_impulse/atr:.1f}×ATR")
-        if imp_bear:  bearish_signals.append(f"Impulsion {signed_impulse/atr:.1f}×ATR")
-        if ema_bull:  bullish_signals.append(f"EMA dist +{ema_dist_signed/atr:.1f}×ATR")
-        if ema_bear:  bearish_signals.append(f"EMA dist {ema_dist_signed/atr:.1f}×ATR")
+    last_high = float(last["High"])
+    last_low  = float(last["Low"])
 
-    if range_cond:
-        triggered = []
-        if ratio_curr >= 2.0: triggered.append(f"act.×{ratio_curr:.2f}")
-        if ratio_prev >= 2.0: triggered.append(f"préc.×{ratio_prev:.2f}")
-        label = f"Range ({', '.join(triggered)}) moy"
-        if ema_dist_signed >= 0:
-            bullish_signals.append(label)
-        else:
-            bearish_signals.append(label)
+    # Chercher le swing high le plus récent dont la mèche est cassée
+    for idx, wick_level, ts, wick_atr in reversed(swing_highs):
+        if last_high > wick_level:
+            base.update({
+                "detected":    True,
+                "direction":   "bearish",
+                "wick_level":  round(wick_level, 5),
+                "swing_type":  "high",
+                "swing_ts":    ts,
+                "swing_idx":   idx,
+                "wick_ratio":    wick_atr,
+                "break_atr":   round((last_high - wick_level) / atr, 2),
+            })
+            return base
 
-    # Direction
-    if len(bullish_signals) >= len(bearish_signals):
-        direction = "bullish"
-        signals   = bullish_signals
-    else:
-        direction = "bearish"
-        signals   = bearish_signals
+    # Chercher le swing low le plus récent dont la mèche est cassée
+    for idx, wick_level, ts, wick_atr in reversed(swing_lows):
+        if last_low < wick_level:
+            base.update({
+                "detected":    True,
+                "direction":   "bullish",
+                "wick_level":  round(wick_level, 5),
+                "swing_type":  "low",
+                "swing_ts":    ts,
+                "swing_idx":   idx,
+                "wick_ratio":    wick_atr,
+                "break_atr":   round((wick_level - last_low) / atr, 2),
+            })
+            return base
 
-    strength = len(signals)
-    base.update({
-        "detected":     True,
-        "direction":    direction,
-        "signals":      signals,
-        "strength":     strength,
-        "strength_bar": _strength_stars(strength),
-    })
+    base["reject_reason"] = "aucune cassure de mèche"
     return base
 
 
 # ─── Génération du graphique ──────────────────────────────────────────────────
 
-def generate_chart(df: pd.DataFrame, pair: str, direction: str) -> bytes:
+def generate_chart(df: pd.DataFrame, pair: str, result: dict) -> bytes:
     """
     Chandelier japonais H1, style sombre TradingView.
     - Fenêtre : minuit J-2 → maintenant + 12h vides à droite
-    - EMA 20 blanche
-    - Ligne pointillée à chaque minuit
-    - Ligne pointillée séparant passé / futur
+    - Ligne horizontale dorée sur la mèche cassée
+    - Marqueur vertical au swing d'origine
+    - Ligne pointillée à chaque minuit + séparateur passé/futur
     """
     from datetime import timezone
 
-    # ── Fenêtre : minuit d'il y a 2 jours ────────────────────────────────
-    now      = datetime.now(timezone.utc)
-    start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=2)
+    direction = result["direction"]
+    swing_ts  = result.get("swing_ts")
+    now       = datetime.now(timezone.utc)
 
-    # Harmoniser timezone avec l'index du DataFrame
+    # Fenêtre dynamique : depuis 3 bougies avant le swing jusqu'à maintenant
+    if swing_ts is not None:
+        # Harmoniser la timezone pour la comparaison
+        swing_aware = swing_ts
+        if hasattr(swing_ts, "tzinfo") and swing_ts.tzinfo is None:
+            swing_aware = swing_ts.replace(tzinfo=timezone.utc)
+        start_dt = swing_aware - timedelta(hours=3)
+    else:
+        start_dt = now - timedelta(days=2)
+
     if df.index.tzinfo is None:
         start_dt = start_dt.replace(tzinfo=None)
-
-    # Calculer l'EMA sur tout le df (évite l'effet de chauffe en début de fenêtre)
-    ema20_full = compute_ema(df["Close"], EMA_FAST)
+    elif start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
 
     chart_df = df[df.index >= start_dt].copy()
-    ema20    = ema20_full[chart_df.index]
+    # Minimum 24 bougies pour la lisibilité
+    if len(chart_df) < 24:
+        chart_df = df.tail(24).copy()
 
-    if chart_df.empty:
-        chart_df = df.tail(48).copy()
-        ema20    = ema20_full[chart_df.index]
-
-    add_plots = [
-        mpf.make_addplot(ema20, color="#FFFFFF", width=1.4, label=f"EMA {EMA_FAST}"),
-    ]
     mc = mpf.make_marketcolors(
         up="#26a69a", down="#ef5350",
         edge="inherit", wick="inherit",
@@ -365,14 +323,16 @@ def generate_chart(df: pd.DataFrame, pair: str, direction: str) -> bytes:
         },
     )
 
-    label_dir = "BULLISH 🔼" if direction == "bullish" else "BEARISH 🔽"
+    label_dir  = "BULLISH 🔼" if direction == "bullish" else "BEARISH 🔽"
+    swing_age_h = int((now - (swing_ts.replace(tzinfo=timezone.utc) if swing_ts and swing_ts.tzinfo is None else (swing_ts or now))).total_seconds() / 3600) if swing_ts else 0
+    age_label  = f"{swing_age_h // 24}j" if swing_age_h >= 24 else f"{swing_age_h}h"
+
     buf = io.BytesIO()
     fig, axes = mpf.plot(
         chart_df,
         type="candle",
         style=style,
-        addplot=add_plots,
-        title=f"\n{pair}  ·  H1  ·  Overextension {label_dir}",
+        title=f"\n{pair}  ·  H1  ·  Wick Break {label_dir}  ·  swing {age_label}",
         figsize=(14, 7),
         returnfig=True,
         tight_layout=True,
@@ -380,9 +340,48 @@ def generate_chart(df: pd.DataFrame, pair: str, direction: str) -> bytes:
         volume=False,
     )
 
-    ax = axes[0]
+    ax   = axes[0]
     xmin, xmax = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
+
+    # ── Ligne horizontale : niveau de la mèche cassée ─────────────────────
+    wick_level = result["wick_level"]
+    ax.axhline(
+        y=wick_level,
+        color="#FFD700",
+        linewidth=1.4,
+        linestyle="--",
+        alpha=0.9,
+        zorder=3,
+    )
+    ax.text(
+        xmax + 0.5, wick_level,
+        f"  {wick_level}",
+        color="#FFD700",
+        fontsize=8,
+        va="center",
+    )
+
+    # ── Marqueur vertical au swing d'origine ──────────────────────────────
+    swing_ts = result.get("swing_ts")
+    if swing_ts is not None and swing_ts in chart_df.index:
+        swing_pos = chart_df.index.get_loc(swing_ts)
+        ax.axvline(
+            x=swing_pos,
+            color="#FFD700",
+            linewidth=0.9,
+            linestyle=":",
+            alpha=0.65,
+            zorder=2,
+        )
+        label_swing = "Swing High" if result["swing_type"] == "high" else "Swing Low"
+        ax.text(
+            swing_pos + 0.3, ymax,
+            label_swing,
+            color="#FFD700",
+            fontsize=7.5,
+            va="top",
+        )
 
     # ── Lignes verticales à chaque minuit ─────────────────────────────────
     for i, ts in enumerate(chart_df.index):
@@ -403,7 +402,7 @@ def generate_chart(df: pd.DataFrame, pair: str, direction: str) -> bytes:
                 va="top",
             )
 
-    # ── Espace vide de 12h à droite + séparateur passé/futur ─────────────
+    # ── Espace vide 12h + séparateur passé/futur ──────────────────────────
     ax.set_xlim(xmin, xmax + CHART_RIGHT_MARGIN)
     ax.axvline(
         x=xmax - 0.5,
@@ -431,7 +430,6 @@ def generate_chart(df: pd.DataFrame, pair: str, direction: str) -> bytes:
 
 
 # ─── Gestion de l'état anti-doublon ──────────────────────────────────────────
-# En GitHub Actions, alert_state.json est persisté via le cache entre les runs.
 
 def load_alert_state() -> dict:
     if ALERT_STATE_FILE.exists():
@@ -446,24 +444,21 @@ def save_alert_state(state: dict) -> None:
     ALERT_STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def _alert_key(pair: str, direction: str, signals: list) -> str:
-    """Clé unique = paire + direction + ensemble exact des signaux.
-    Si les signaux changent (même paire, même direction), la clé change
-    → le cooldown ne s'applique pas → nouvelle alerte autorisée."""
-    return f"{pair}|{direction}|{','.join(sorted(signals))}"
+def _alert_key(pair: str, direction: str, wick_level: float) -> str:
+    """Clé unique = paire + direction + niveau de mèche arrondi au pip."""
+    return f"{pair}|{direction}|{wick_level:.5f}"
 
 
-def is_on_cooldown(state: dict, pair: str, direction: str, signals: list) -> bool:
-    key = _alert_key(pair, direction, signals)
+def is_on_cooldown(state: dict, pair: str, direction: str, wick_level: float) -> bool:
+    key = _alert_key(pair, direction, wick_level)
     if key not in state:
         return False
     last_alert = datetime.fromisoformat(state[key])
     return datetime.utcnow() - last_alert < timedelta(hours=COOLDOWN_HOURS)
 
 
-def mark_alerted(state: dict, pair: str, direction: str, signals: list) -> None:
-    state[_alert_key(pair, direction, signals)] = datetime.utcnow().isoformat()
-
+def mark_alerted(state: dict, pair: str, direction: str, wick_level: float) -> None:
+    state[_alert_key(pair, direction, wick_level)] = datetime.utcnow().isoformat()
 
 
 # ─── Envoi Telegram ───────────────────────────────────────────────────────────
@@ -475,25 +470,27 @@ async def send_alert(
     tv_symbol: str,
     chart_bytes: bytes,
 ) -> None:
-    direction  = result["direction"]
-    emoji_main = "🔥" if direction == "bullish" else "❄️"
-    arrow      = "🔼" if direction == "bullish" else "🔽"
-    tv_url_https = f"https://fr.tradingview.com/chart/?symbol={tv_symbol}"
-
-    signals_text = "\n".join(f"✅ `{s}`" for s in result["signals"])
-    now_str = _now_paris().strftime("%d/%m/%Y %H:%M")
+    direction    = result["direction"]
+    arrow        = "🔼" if direction == "bullish" else "🔽"
+    emoji_sweep  = "🟢" if direction == "bullish" else "🔴"
+    swing_label  = "Swing Low" if result["swing_type"] == "low" else "Swing High"
+    tv_url       = f"https://fr.tradingview.com/chart/?symbol={tv_symbol}"
+    now_str      = _now_paris().strftime("%d/%m/%Y %H:%M")
+    swing_ts_str = result["swing_ts"].strftime("%d/%m %Hh") if result.get("swing_ts") is not None else "?"
 
     caption = (
-        f"*New overextension on {pair} {emoji_main}*\n\n"
+        f"*Wick Break — {pair}* {arrow}\n\n"
         f"🕐 `{now_str}`\n"
         f"{arrow} *Direction :* {direction.capitalize()}\n"
-        f"💰 *Prix :* `{result['price']}`\n\n"
-        f"📡 *Signaux déclenchés :*\n{signals_text}\n\n"
-        f"⚡ *Force du signal :*\n{result['strength_bar']}"
+        f"💰 *Prix actuel :* `{result['price']}`\n\n"
+        f"📍 *Mèche cassée :* `{result['wick_level']}`\n"
+        f"   {swing_label} du `{swing_ts_str}`\n"
+        f"   Mèche = `{result['wick_ratio']}×` le corps\n\n"
+        f"📏 *Cassure :* `{result['break_atr']}×ATR` {emoji_sweep}"
     )
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📈 Ouvrir dans TradingView", url=tv_url_https),
+        InlineKeyboardButton("📈 Ouvrir dans TradingView", url=tv_url),
     ]])
 
     await bot.send_photo(
@@ -505,26 +502,22 @@ async def send_alert(
     )
     log.info(
         f"✅ Alerte envoyée : {pair} {direction} "
-        f"| RSI={result['rsi']} | {result['impulse_atr']}×ATR"
+        f"| Wick={result['wick_level']} | Break={result['break_atr']}×ATR"
     )
 
 
-
-
-
-# ─── Scan unique (appelé une fois par run GitHub Actions) ────────────────────
+# ─── Scan unique ──────────────────────────────────────────────────────────────
 
 async def scan_all(bot: Bot) -> None:
     log.info("=" * 60)
     log.info(f"Scan démarré — {_now_paris().strftime('%Y-%m-%d %H:%M:%S')} (Paris)")
     log.info(f"Paires surveillées : {len(FOREX_PAIRS)}")
     log.info("─" * 60)
-    log.info("CONDITIONS DE DÉCLENCHEMENT (logique OR + filtre ET) :")
-    log.info(f"  ① RSI extrême     : RSI > {RSI_OVERBOUGHT} (haussier)  ou  RSI < {RSI_OVERSOLD} (baissier)  [période {RSI_PERIOD}]")
-    log.info(f"  ② Impulsion forte : move net sur {IMPULSE_WINDOW} bougies  >  {ATR_MULT_IMPULSE}× ATR")
-    log.info(f"  ③ Distance EMA    : |prix − EMA{EMA_FAST}|  >  {ATR_MULT_EMA_DIST}× ATR")
-    log.info(f"  ④ Range seul      : range bougie actuelle ≥ 2.0× moy des {CANDLE_RANGE_LOOKBACK} précédentes")
-    log.info(f"  [COOLDOWN]        : {COOLDOWN_HOURS}h par paire/direction/signaux identiques")
+    log.info("DÉTECTION : cassure de mèche sur swing H1")
+    log.info(f"  Swing lookback      : {SWING_LOOKBACK} bougie de chaque côté")
+    log.info(f"  Fenêtre de recherche: {SWING_SEARCH_WINDOW} bougies H1 ({SWING_SEARCH_WINDOW // 24}j)")
+    log.info(f"  Mèche minimale      : {MIN_WICK_BODY_RATIO}× le corps de la bougie")
+    log.info(f"  Cooldown         : {COOLDOWN_HOURS}h par paire/direction/niveau")
     log.info("=" * 60)
 
     state      = load_alert_state()
@@ -532,55 +525,39 @@ async def scan_all(bot: Bot) -> None:
 
     for pair, info in FOREX_PAIRS.items():
         try:
-            # ── Fetch H1 ──────────────────────────────────────────────────
             df = fetch_h1_data(info["yf"])
             if df is None:
                 log.info(f"  {pair:<12} | ⚠️  données indisponibles")
                 continue
 
-            result = detect_overextension(df)
-
-            # ── Log détaillé des indicateurs ──────────────────────────────
-            ok  = "✅"
-            nok = "❌"
-            rsi_ok = ok if abs(result["rsi"] - 50) >= (50 - RSI_OVERSOLD) else nok
-            imp_ok = ok if abs(result["impulse_atr"]) >= ATR_MULT_IMPULSE  else nok
-            ema_ok = ok if abs(result["ema_dist_atr"]) >= ATR_MULT_EMA_DIST else nok
-            rng_ok = ok if result["candle_range_ratio"] >= 2.0              else nok
-            log.info(
-                f"  {pair:<12} | "
-                f"Prix={result['price']}  ATR={result['atr']}  "
-                f"RSI={result['rsi']}{rsi_ok}  "
-                f"Imp={result['impulse_atr']:+.2f}×{imp_ok}  "
-                f"EMA={result['ema_dist_atr']:+.2f}×{ema_ok}  "
-                f"Range=×{result['candle_range_ratio']}{rng_ok}"
-            )
+            result = detect_wick_break(df)
 
             if result["detected"]:
-                direction = result["direction"]
+                direction  = result["direction"]
+                wick_level = result["wick_level"]
+                swing_ts   = result.get("swing_ts")
+                ts_str     = swing_ts.strftime("%d/%m %Hh") if swing_ts is not None else "?"
                 log.info(
-                    f"  {pair:<12} | 🚨 OVEREXTENSION {direction.upper()} "
-                    f"— {result['strength_bar']} "
-                    f"— signaux : {', '.join(result['signals'])}"
+                    f"  {pair:<12} | 🚨 WICK BREAK {direction.upper()} "
+                    f"— mèche={wick_level} ({result['swing_type'].upper()} du {ts_str}) "
+                    f"cassure={result['break_atr']}×ATR"
                 )
-                on_cd = is_on_cooldown(state, pair, direction, result["signals"])
+                on_cd = is_on_cooldown(state, pair, direction, wick_level)
                 if not on_cd:
-                    chart_bytes = generate_chart(df, pair, direction)
+                    chart_bytes = generate_chart(df, pair, result)
                     await send_alert(bot, pair, result, info["tv"], chart_bytes)
-                    mark_alerted(state, pair, direction, result["signals"])
+                    mark_alerted(state, pair, direction, wick_level)
                     save_alert_state(state)
                     total_sent += 1
-                    log.info(f"  {pair:<12} | ✅ alerte envoyée")
                     await asyncio.sleep(1.5)
                 else:
                     log.info(f"  {pair:<12} | 🔒 cooldown actif — rien envoyé")
             else:
-                log.info(f"  {pair:<12} | ⛔ non déclenché — {result['reject_reason']}")
+                log.info(f"  {pair:<12} | ⛔ {result['reject_reason']}")
 
         except Exception as exc:
             log.error(f"  {pair:<12} | 💥 erreur inattendue : {exc}", exc_info=True)
 
-    # ── Séparateur de fin de salve épinglé ───────────────────────────────
     if total_sent > 0:
         msg = await bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
@@ -601,8 +578,6 @@ async def scan_all(bot: Bot) -> None:
 
 
 # ─── Point d'entrée ───────────────────────────────────────────────────────────
-# GitHub Actions déclenche ce script toutes les 15 min via le cron du workflow.
-# En local, pour tourner en continu, utilise run_local.py.
 
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
