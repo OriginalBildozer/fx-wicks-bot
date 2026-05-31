@@ -14,19 +14,7 @@ warnings.filterwarnings("ignore")
 
 from datetime import datetime, timezone, timedelta
 import pandas as pd
-import requests
 import yfinance as yf
-
-_YF_SESSION = requests.Session()
-_YF_SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-})
 
 from forex_bot import (
     FOREX_PAIRS,
@@ -59,17 +47,17 @@ def line(char="─", n=60):
 # ─── Fetch historique jusqu'à une date précise ────────────────────────────────
 
 def fetch_until(yf_ticker: str, target_dt: datetime) -> pd.DataFrame | None:
-    start = target_dt - timedelta(days=20)
-    end   = target_dt + timedelta(hours=2)
+    """
+    Télécharge 60 jours de données H1 via period= (plus fiable que start/end
+    sur Yahoo Finance) puis retourne tout le DataFrame — slice_at() fera le filtre.
+    """
     try:
         df = yf.download(
             yf_ticker,
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d %H:%M:%S"),
+            period="60d",
             interval="1h",
             progress=False,
             auto_adjust=True,
-            session=_YF_SESSION,
         )
         if df.empty:
             return None
