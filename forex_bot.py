@@ -246,7 +246,6 @@ def detect_wick_break(df: pd.DataFrame) -> dict:
                 "swing_ts":    ts,
                 "swing_idx":   idx,
                 "wick_ratio":  wick_atr,
-                "break_atr":   round((last_high - wick_level) / atr, 2),
             })
             return base
 
@@ -266,7 +265,6 @@ def detect_wick_break(df: pd.DataFrame) -> dict:
                 "swing_ts":    ts,
                 "swing_idx":   idx,
                 "wick_ratio":  wick_atr,
-                "break_atr":   round((wick_level - last_low) / atr, 2),
             })
             return base
 
@@ -378,26 +376,33 @@ def generate_chart(df: pd.DataFrame, pair: str, result: dict) -> bytes:
         va="center",
     )
 
-    # ── Marqueur vertical au swing d'origine ──────────────────────────────
+    # ── Triangle sur la bougie du swing d'origine ────────────────────────
     swing_ts = result.get("swing_ts")
     if swing_ts is not None and swing_ts in chart_df.index:
-        swing_pos = chart_df.index.get_loc(swing_ts)
-        ax.axvline(
-            x=swing_pos,
-            color="#FFD700",
-            linewidth=0.9,
-            linestyle=":",
-            alpha=0.65,
-            zorder=2,
-        )
-        label_swing = "Swing High" if result["swing_type"] == "high" else "Swing Low"
-        ax.text(
-            swing_pos + 0.3, ymax,
-            label_swing,
-            color="#FFD700",
-            fontsize=7.5,
-            va="top",
-        )
+        swing_pos    = chart_df.index.get_loc(swing_ts)
+        swing_candle = chart_df.loc[swing_ts]
+        offset       = (ymax - ymin) * 0.015   # 1.5 % de la plage visible
+
+        if result["swing_type"] == "low":
+            # Triangle pointant vers le bas, sous la mèche basse
+            ax.scatter(
+                swing_pos,
+                float(swing_candle["Low"]) - offset,
+                marker="v",
+                color="#FFD700",
+                s=130,
+                zorder=5,
+            )
+        else:
+            # Triangle pointant vers le haut, au-dessus de la mèche haute
+            ax.scatter(
+                swing_pos,
+                float(swing_candle["High"]) + offset,
+                marker="^",
+                color="#FFD700",
+                s=130,
+                zorder=5,
+            )
 
     # ── Lignes verticales à chaque minuit ─────────────────────────────────
     for i, ts in enumerate(chart_df.index):
@@ -501,8 +506,7 @@ async def send_alert(
         f"💰 *Prix actuel :* `{result['price']}`\n\n"
         f"📍 *Mèche cassée :* `{result['wick_level']}`\n"
         f"   {swing_label} du `{swing_ts_str}`\n"
-        f"   Mèche = `{result['wick_ratio']}×` le corps\n\n"
-        f"📏 *Cassure :* `{result['break_atr']}×ATR` {emoji_sweep}"
+        f"   Mèche = `{result['wick_ratio']}×` le corps"
     )
 
     keyboard = InlineKeyboardMarkup([[
@@ -556,7 +560,7 @@ async def scan_all(bot: Bot) -> None:
                 log.info(
                     f"  {pair:<12} | 🚨 WICK BREAK {direction.upper()} "
                     f"— mèche={wick_level} ({result['swing_type'].upper()} du {ts_str}) "
-                    f"cassure={result['break_atr']}×ATR"
+                    f"mèche={result['wick_ratio']}×corps"
                 )
                 on_cd = is_on_cooldown(state, pair, direction, wick_level)
                 if not on_cd:
