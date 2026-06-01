@@ -228,9 +228,16 @@ def detect_wick_break(df: pd.DataFrame) -> dict:
     last_high = float(last["High"])
     last_low  = float(last["Low"])
 
+    found_stale = False  # un break existe mais le niveau a déjà été tradé
+
     # Chercher le swing high le plus récent dont la mèche est cassée
     for idx, wick_level, ts, wick_atr in reversed(swing_highs):
         if last_high > wick_level:
+            # Vérifier que le niveau n'a jamais été atteint depuis le swing
+            between = history.iloc[idx + 1:]
+            if not between.empty and float(between["High"].max()) > wick_level:
+                found_stale = True
+                continue  # niveau déjà tradé → pas frais, on passe
             base.update({
                 "detected":    True,
                 "direction":   "bearish",
@@ -238,7 +245,7 @@ def detect_wick_break(df: pd.DataFrame) -> dict:
                 "swing_type":  "high",
                 "swing_ts":    ts,
                 "swing_idx":   idx,
-                "wick_ratio":    wick_atr,
+                "wick_ratio":  wick_atr,
                 "break_atr":   round((last_high - wick_level) / atr, 2),
             })
             return base
@@ -246,6 +253,11 @@ def detect_wick_break(df: pd.DataFrame) -> dict:
     # Chercher le swing low le plus récent dont la mèche est cassée
     for idx, wick_level, ts, wick_atr in reversed(swing_lows):
         if last_low < wick_level:
+            # Vérifier que le niveau n'a jamais été atteint depuis le swing
+            between = history.iloc[idx + 1:]
+            if not between.empty and float(between["Low"].min()) < wick_level:
+                found_stale = True
+                continue  # niveau déjà tradé → pas frais, on passe
             base.update({
                 "detected":    True,
                 "direction":   "bullish",
@@ -253,12 +265,16 @@ def detect_wick_break(df: pd.DataFrame) -> dict:
                 "swing_type":  "low",
                 "swing_ts":    ts,
                 "swing_idx":   idx,
-                "wick_ratio":    wick_atr,
+                "wick_ratio":  wick_atr,
                 "break_atr":   round((wick_level - last_low) / atr, 2),
             })
             return base
 
-    base["reject_reason"] = "aucune cassure de mèche"
+    base["reject_reason"] = (
+        "cassure déjà tradée — niveau non frais"
+        if found_stale else
+        "aucune cassure de mèche"
+    )
     return base
 
 
