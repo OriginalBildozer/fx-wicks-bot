@@ -384,21 +384,21 @@ def generate_chart(df: pd.DataFrame, pair: str, result: dict) -> bytes:
         offset       = (ymax - ymin) * 0.015   # 1.5 % de la plage visible
 
         if result["swing_type"] == "low":
-            # Triangle pointant vers le bas, sous la mèche basse
+            # Triangle pointant vers le haut, sous la mèche basse
             ax.scatter(
                 swing_pos,
                 float(swing_candle["Low"]) - offset,
-                marker="v",
+                marker="^",
                 color="#FFD700",
                 s=130,
                 zorder=5,
             )
         else:
-            # Triangle pointant vers le haut, au-dessus de la mèche haute
+            # Triangle pointant vers le bas, au-dessus de la mèche haute
             ax.scatter(
                 swing_pos,
                 float(swing_candle["High"]) + offset,
-                marker="^",
+                marker="v",
                 color="#FFD700",
                 s=130,
                 zorder=5,
