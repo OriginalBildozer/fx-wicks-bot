@@ -584,16 +584,18 @@ async def scan_all(bot: Bot) -> None:
             text="‼️" * 15,
         )
         try:
-            # Désépingler tous les messages précédents, puis épingler uniquement le nouveau
             await bot.unpin_all_chat_messages(chat_id=TELEGRAM_CHANNEL_ID)
+        except Exception as e:
+            log.warning(f"Impossible de désépingler les anciens messages : {e}")
+        try:
             await bot.pin_chat_message(
                 chat_id=TELEGRAM_CHANNEL_ID,
                 message_id=msg.message_id,
                 disable_notification=True,
             )
-            log.info("📌 Séparateur épinglé (anciens désépinglés)")
+            log.info("📌 Séparateur épinglé")
         except Exception as e:
-            log.warning(f"Impossible d'épingler le message : {e}")
+            log.warning(f"Impossible d'épingler le séparateur : {e}")
 
     log.info("-" * 60)
     log.info(f"Scan terminé — {total_sent} message(s) envoyé(s)")
