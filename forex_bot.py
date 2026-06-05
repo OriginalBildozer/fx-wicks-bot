@@ -526,6 +526,29 @@ async def send_alert(
     )
 
 
+# ─── Séparateur épinglé ───────────────────────────────────────────────────────
+
+async def _send_separator(bot: Bot) -> None:
+    """Envoie le séparateur ‼️ et l'épingle (remplace le précédent)."""
+    msg = await bot.send_message(
+        chat_id=TELEGRAM_CHANNEL_ID,
+        text="‼️" * 15,
+    )
+    try:
+        await bot.unpin_all_chat_messages(chat_id=TELEGRAM_CHANNEL_ID)
+    except Exception as e:
+        log.warning(f"Impossible de désépingler les anciens messages : {e}")
+    try:
+        await bot.pin_chat_message(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            message_id=msg.message_id,
+            disable_notification=True,
+        )
+        log.info("📌 Séparateur épinglé")
+    except Exception as e:
+        log.warning(f"Impossible d'épingler le séparateur : {e}")
+
+
 # ─── Scan unique ──────────────────────────────────────────────────────────────
 
 async def scan_all(bot: Bot) -> None:
@@ -569,6 +592,8 @@ async def scan_all(bot: Bot) -> None:
                     mark_alerted(state, pair, direction, wick_level)
                     save_alert_state(state)
                     total_sent += 1
+                    # Séparateur épinglé après chaque alerte
+                    await _send_separator(bot)
                     await asyncio.sleep(1.5)
                 else:
                     log.info(f"  {pair:<12} | 🔒 cooldown actif — rien envoyé")
@@ -577,25 +602,6 @@ async def scan_all(bot: Bot) -> None:
 
         except Exception as exc:
             log.error(f"  {pair:<12} | 💥 erreur inattendue : {exc}", exc_info=True)
-
-    if total_sent > 0:
-        msg = await bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            text="‼️" * 15,
-        )
-        try:
-            await bot.unpin_all_chat_messages(chat_id=TELEGRAM_CHANNEL_ID)
-        except Exception as e:
-            log.warning(f"Impossible de désépingler les anciens messages : {e}")
-        try:
-            await bot.pin_chat_message(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                message_id=msg.message_id,
-                disable_notification=True,
-            )
-            log.info("📌 Séparateur épinglé")
-        except Exception as e:
-            log.warning(f"Impossible d'épingler le séparateur : {e}")
 
     log.info("-" * 60)
     log.info(f"Scan terminé — {total_sent} message(s) envoyé(s)")
