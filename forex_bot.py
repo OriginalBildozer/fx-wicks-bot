@@ -592,8 +592,6 @@ async def scan_all(bot: Bot) -> None:
                     mark_alerted(state, pair, direction, wick_level)
                     save_alert_state(state)
                     total_sent += 1
-                    # Séparateur épinglé après chaque alerte
-                    await _send_separator(bot)
                     await asyncio.sleep(1.5)
                 else:
                     log.info(f"  {pair:<12} | 🔒 cooldown actif — rien envoyé")
@@ -602,6 +600,9 @@ async def scan_all(bot: Bot) -> None:
 
         except Exception as exc:
             log.error(f"  {pair:<12} | 💥 erreur inattendue : {exc}", exc_info=True)
+
+    if total_sent > 0:
+        await _send_separator(bot)
 
     log.info("-" * 60)
     log.info(f"Scan terminé — {total_sent} message(s) envoyé(s)")
