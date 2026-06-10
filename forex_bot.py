@@ -563,8 +563,9 @@ async def scan_all(bot: Bot) -> None:
     log.info(f"  Cooldown         : {COOLDOWN_HOURS}h par paire/direction/niveau")
     log.info("=" * 60)
 
-    state      = load_alert_state()
-    total_sent = 0
+    state           = load_alert_state()
+    total_sent      = 0
+    separator_sent  = False  # séparateur envoyé avant la 1ère alerte du run
 
     for pair, info in FOREX_PAIRS.items():
         try:
@@ -587,6 +588,10 @@ async def scan_all(bot: Bot) -> None:
                 )
                 on_cd = is_on_cooldown(state, pair, direction, wick_level)
                 if not on_cd:
+                    # Séparateur envoyé une seule fois, avant la première alerte du run
+                    if not separator_sent:
+                        await _send_separator(bot)
+                        separator_sent = True
                     chart_bytes = generate_chart(df, pair, result)
                     await send_alert(bot, pair, result, info["tv"], chart_bytes)
                     mark_alerted(state, pair, direction, wick_level)
@@ -600,9 +605,6 @@ async def scan_all(bot: Bot) -> None:
 
         except Exception as exc:
             log.error(f"  {pair:<12} | 💥 erreur inattendue : {exc}", exc_info=True)
-
-    if total_sent > 0:
-        await _send_separator(bot)
 
     log.info("-" * 60)
     log.info(f"Scan terminé — {total_sent} message(s) envoyé(s)")
