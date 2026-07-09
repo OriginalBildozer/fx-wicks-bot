@@ -125,7 +125,7 @@ def fetch_m5_data(yf_ticker: str) -> pd.DataFrame | None:
     try:
         df = yf.download(
             yf_ticker,
-            period="7d",
+            period="3d",
             interval="5m",
             progress=False,
             auto_adjust=True,
