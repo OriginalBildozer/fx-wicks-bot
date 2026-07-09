@@ -15,7 +15,7 @@ from telegram import Bot
 
 load_dotenv()
 
-SCAN_INTERVAL_MIN = 15
+SCAN_INTERVAL_MIN = 5
 
 logging.basicConfig(
     level=logging.INFO,

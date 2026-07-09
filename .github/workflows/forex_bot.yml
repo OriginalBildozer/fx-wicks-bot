@@ -3,7 +3,7 @@ name: 📈 FX Wicks Bot — Wick Break Scanner
 # ─── Déclencheurs ─────────────────────────────────────────────────────────────
 on:
   schedule:
-    - cron: "*/15 * * * 1-5"  # Toutes les 15 min, lundi→vendredi (forex market hours)
+    - cron: "*/5 * * * 1-5"   # Toutes les 5 min, lundi→vendredi (M5)
   workflow_dispatch:          # Déclenchement manuel depuis l'UI GitHub
 
 # ─── Permissions minimales ────────────────────────────────────────────────────
